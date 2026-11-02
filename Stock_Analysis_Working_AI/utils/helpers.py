@@ -1,4 +1,4 @@
-
+import re
 from pathlib import Path
 
 import pandas as pd
@@ -32,15 +32,21 @@ ALIASES = {
 
 
 def normalize_text(text: str) -> str:
-    """Normalize text without accidentally deleting parts of company names."""
+    """Normalize text and handle possessive forms."""
+
     text = str(text).lower().strip()
+
+    # Handle possessive forms before removing punctuation
+    text = re.sub(r"'s\b", "", text)
+
     text = text.replace("&", " and ")
+
     text = "".join(
         char if char.isalnum() or char.isspace() else " "
         for char in text
     )
-    return " ".join(text.split())
 
+    return " ".join(text.split())
 
 def extract_company_name(user_query: str) -> str:
     """Remove common stock-question words while preserving company names."""
@@ -49,21 +55,19 @@ def extract_company_name(user_query: str) -> str:
     remove_words = {
         "analyze", "analyse", "stock", "stocks", "share", "shares",
         "price", "prices", "current", "latest", "today", "buy", "sell",
-        "hold", "invest", "should", "can", "could", "would", "tell",
-        "show", "about", "of", "for", "me", "please", "what", "is",
-        "the", "do", "i", "my", "add", "remove", "portfolio", "to",
-        "from", "get", "give", "check", "find", "company", "companies",
-        "market", "value", "trading", "traded", "share", "shares",
-        "stock", "stocks", "today", "now", "right", "tell", "know",
-        "how", "much", "does", "did", "was", "were", "are", "and",
-        "its", "their", "please", "me", "in", "on", "at",
+        "hold", "invest", "cap", "health", "should", "can", "could",
+        "would", "tell", "show", "about", "of", "for", "me", "please",
+        "what", "is", "the", "do", "i", "my", "add", "remove",
+        "portfolio", "to", "from", "get", "give", "check", "find",
+        "company", "companies", "market", "value", "trading", "traded",
+        "now", "right", "know", "how", "much", "does", "did", "was",
+        "were", "are", "and", "its", "their", "in", "on", "at"
     }
 
     words = query.split()
     filtered = [word for word in words if word not in remove_words]
 
     return " ".join(filtered)
-
 
 def get_ticker(user_query: str) -> str | None:
     """Resolve a query to an NSE ticker, avoiding weak fuzzy matches."""
@@ -87,19 +91,24 @@ def get_ticker(user_query: str) -> str | None:
         if query == company:
             return f"{symbol}.NS"
 
-    # Match a complete company name contained in a longer query.
-    # Prefer the longest matching name to reduce ambiguous matches.
+
+    # Match complete company names contained in longer queries.
+    # Require at least two words to avoid matching generic words
+    # such as "health", "technology", or "industries".
+
     matches = []
 
-    for _, row in COMPANIES.iterrows():
-        symbol = str(row["SYMBOL"]).strip()
-        company = normalize_text(row["NAME OF COMPANY"])
+    if len(query.split()) >= 2:
 
-        if len(query) >= 4 and (
-            f" {query} " in f" {company} "
-            or f" {company} " in f" {query} "
-        ):
-            matches.append((len(company), symbol))
+        for _, row in COMPANIES.iterrows():
+            symbol = str(row["SYMBOL"]).strip()
+            company = normalize_text(row["NAME OF COMPANY"])
+
+            if (
+                f" {query} " in f" {company} "
+                or f" {company} " in f" {query} "
+            ):
+                matches.append((len(company), symbol))
 
     if matches:
         matches.sort(reverse=True)
