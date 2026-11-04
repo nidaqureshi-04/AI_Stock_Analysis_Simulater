@@ -9,6 +9,8 @@ Nothing in the backend needs to change.
 """
 from __future__ import annotations
 
+import html
+import inspect
 import os
 import re
 import shutil
@@ -24,24 +26,25 @@ os.chdir(APP_DIR)
 
 import pandas as pd
 import sys
-import plotly.graph_objects as go
 import streamlit as st
 import yfinance as yf
-from plotly.subplots import make_subplots
-from ta.momentum import RSIIndicator
-from ta.trend import MACD, SMAIndicator
-from ta.volatility import BollingerBands
 
 # The backend uses paths relative to the project root (memory/, data/).
 APP_DIR = Path(__file__).resolve().parent
 os.chdir(APP_DIR)
 sys.path.insert(0, str(APP_DIR))
 
+from utils.charting import (  # noqa: E402  (needs APP_DIR on sys.path)
+    DEFAULT_OVERLAYS, OVERLAY_OPTIONS, build_chart, chart_notes, compute_indicator_frame,
+)
+from utils.portfolio_actions import add_selected, holding_tickers  # noqa: E402
+from utils.stock_search import load_universe, normalise, search  # noqa: E402
+
 st.set_page_config(
     page_title="AI Stock Analyst · NSE",
     page_icon="📈",
     layout="wide",
-    initial_sidebar_state="expanded",
+    initial_sidebar_state="auto",
 )
 
 # ---------------------------------------------------------------------------
@@ -142,49 +145,141 @@ else:
 # ---------------------------------------------------------------------------
 # Styling
 # ---------------------------------------------------------------------------
-UP, DOWN, ACCENT = "#3DDC97", "#FF5C7A", "#3DDC97"
+# Theme tokens: (light, dark). Single source for every custom (non-native) surface.
+# Native widgets read the same values from .streamlit/config.toml - keep both in
+# sync (tests/test_theme_tokens.py checks this).
+THEME = {
+    "bg":      ("#F5F7FA", "#0B1118"),
+    "card":    ("#FFFFFF", "#121B26"),
+    "surface": ("#EDF2F7", "#182433"),
+    "text":    ("#172B4D", "#E8EEF5"),
+    "text-2":  ("#526277", "#A7B4C5"),
+    "border":  ("#D8E1EB", "#293747"),
+    "accent":  ("#0F766E", "#45C4B0"),
+    "pos":     ("#0B7A4B", "#3DDC97"),
+    "neg":     ("#C0213D", "#FF6B87"),
+    "neu":     ("#8A5A00", "#F6C177"),
+}
 
-st.markdown(
+FONT_IMPORT = (
+    "@import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600"
+    "&family=IBM+Plex+Mono:wght@400;500&family=Fraunces:opsz,wght@9..144,500;9..144,600"
+    "&display=swap');\n"
+)
+
+
+def theme_variables_css() -> str:
     """
-<style>
-@import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&family=Fraunces:opsz,wght@9..144,500;9..144,600&display=swap');
+    Emit --sa-* variables on .stApp.
 
-html, body, [class*="css"], .stApp { font-family: 'IBM Plex Sans', system-ui, sans-serif; }
-.block-container { padding-top: 1.6rem; max-width: 1180px; }
+    Streamlit sets CSS `color-scheme` on .stApp from the *active* theme (OS
+    preference or the Settings switch), so `light-dark()` follows theme changes
+    instantly - no Python-side detection, which can be stale after a switch.
+    Browsers without light-dark() fall back to light values, or to the OS
+    preference via prefers-color-scheme.
+    """
+    light = "".join(f"--sa-{k}:{lt};" for k, (lt, _) in THEME.items())
+    dark = "".join(f"--sa-{k}:{dk};" for k, (_, dk) in THEME.items())
+    both = "".join(f"--sa-{k}:light-dark({lt},{dk});" for k, (lt, dk) in THEME.items())
+    return (
+        f".stApp{{{light}}}\n"
+        f"@media (prefers-color-scheme: dark){{.stApp{{{dark}}}}}\n"
+        f"@supports (color: light-dark(#000,#fff)){{.stApp{{{both}}}}}\n"
+    )
+
+
+COMPONENT_CSS = """
+.stApp { font-family: 'IBM Plex Sans', system-ui, sans-serif; }
+.stApp .block-container { padding-top: 1.6rem; max-width: 1180px; }
 footer, [data-testid="stAppDeployButton"], .stDeployButton { display: none !important; }
 
-.hero h1 { font-family: 'Fraunces', serif; font-weight: 600; font-size: 2.3rem;
-           letter-spacing: -0.01em; margin: 0; line-height: 1.1; }
-.hero h1 { color: #E6EAF0 !important; }
-.hero h1 .accent { color: #3DDC97; }
-.hero p { margin: .35rem 0 0 0; opacity: .65; font-size: .95rem; }
+/* ---- Header / branding ---- */
+.stApp .hero h1 { font-family: 'Fraunces', serif; font-weight: 600;
+  font-size: clamp(1.8rem, 4vw, 2.3rem); letter-spacing: -0.01em; margin: 0;
+  line-height: 1.1; color: var(--sa-text); }
+.stApp .hero h1 .accent { color: var(--sa-accent); }
+.stApp .hero p { margin: .4rem 0 0 0; color: var(--sa-text-2); font-size: .95rem; }
 
-[data-testid="stMetric"] {
-  background: #121821; border: 1px solid #1E2733; border-radius: 12px;
-  padding: .7rem .9rem;
+/* ---- Page navigation (st.segmented_control, key="page") ---- */
+.stApp .st-key-page { border-bottom: 1px solid var(--sa-border);
+  padding-bottom: .65rem; margin-bottom: .9rem; }
+.stApp .st-key-page button { font-weight: 600; }
+
+/* ---- KPI cards: native st.metric + custom .signal share one card style ---- */
+.stApp [data-testid="stMetric"], .stApp .signal {
+  background: var(--sa-card); border: 1px solid var(--sa-border); border-radius: 12px;
+  padding: .7rem .9rem; box-sizing: border-box; min-width: 0; }
+@media (min-width: 641px) {
+  .stApp [data-testid="stMetric"], .stApp .signal { min-height: 5.2rem; }
 }
-[data-testid="stMetricLabel"] p { font-size: .72rem; text-transform: uppercase;
-  letter-spacing: .06em; opacity: .6; }
-[data-testid="stMetricValue"] { font-family: 'IBM Plex Mono', monospace; font-size: 1.15rem; }
-[data-testid="stMetricValue"] > div { overflow: visible !important; text-overflow: clip !important;
-  white-space: normal !important; }
+.stApp [data-testid="stMetricLabel"],
+.stApp [data-testid="stMetricLabel"] p { color: var(--sa-text-2); font-size: .72rem;
+  font-weight: 500; text-transform: uppercase; letter-spacing: .06em; }
+.stApp [data-testid="stMetricValue"] { color: var(--sa-text);
+  font-family: 'IBM Plex Mono', monospace; font-weight: 500; line-height: 1.25;
+  font-size: clamp(.95rem, .55vw + .8rem, 1.15rem); }
+.stApp [data-testid="stMetricValue"] > div { overflow: visible; text-overflow: clip;
+  white-space: normal; overflow-wrap: anywhere; }
+.stApp [data-testid="stMetricValue"] p { white-space: normal; overflow: visible;
+  text-overflow: clip; overflow-wrap: break-word; }
+.stApp [data-testid="stMetricDelta"] { font-size: .8rem; font-weight: 600; }
 
-.signal { background:#121821; border:1px solid #1E2733; border-radius:12px; padding:.7rem .9rem; }
-.signal .k { font-size:.72rem; text-transform:uppercase; letter-spacing:.06em; opacity:.6; }
-.signal .v { font-family:'IBM Plex Mono',monospace; font-size:1.05rem; margin-top:.15rem; }
-.signal .d { font-size:.8rem; opacity:.7; margin-top:.1rem; }
-.pos { color:#3DDC97; } .neg { color:#FF5C7A; } .neu { color:#F6C177; }
+.stApp .signal .k { color: var(--sa-text-2); font-size: .72rem; font-weight: 500;
+  text-transform: uppercase; letter-spacing: .06em; }
+.stApp .signal .v { color: var(--sa-text); font-family: 'IBM Plex Mono', monospace;
+  font-size: 1.05rem; font-weight: 600; margin-top: .15rem; line-height: 1.25;
+  overflow-wrap: anywhere; }
+.stApp .signal .d { color: var(--sa-text-2); font-size: .8rem; margin-top: .1rem; }
+.stApp .signal .v.pos { color: var(--sa-pos); }
+.stApp .signal .v.neg { color: var(--sa-neg); }
+.stApp .signal .v.neu { color: var(--sa-neu); }
 
-.tickerline { font-size:.85rem; opacity:.7; margin:.2rem 0 .4rem 0; }
-.tickerline b { opacity:1; }
-.disclaimer { font-size:.75rem !important; opacity:.55; line-height:1.4; }
+/* ---- Supporting text ---- */
+.stApp .tickerline { font-size: .85rem; color: var(--sa-text-2); margin: .2rem 0 .4rem 0; }
+.stApp .tickerline b { color: var(--sa-text); }
+.stApp .disclaimer { font-size: .75rem !important; color: var(--sa-text-2); line-height: 1.4; }
 
-[data-testid="stChatMessage"] { background: transparent; }
-div[data-testid="stChatMessageContent"] h2 { font-family:'Fraunces',serif; font-size:1.5rem;
-  border-bottom:1px solid #1E2733; padding-bottom:.4rem; }
-div[data-testid="stChatMessageContent"] h3 { font-size:1.05rem; margin-top:1.1rem; }
-</style>
-""",
+/* ---- Chat, expanders ---- */
+.stApp [data-testid="stChatMessage"] { background: transparent; }
+.stApp [data-testid="stChatMessageContent"] h2 { font-family: 'Fraunces', serif;
+  font-size: 1.5rem; border-bottom: 1px solid var(--sa-border); padding-bottom: .4rem; }
+.stApp [data-testid="stChatMessageContent"] h3 { font-size: 1.05rem; margin-top: 1.1rem; }
+.stApp [data-testid="stExpander"] details { background: var(--sa-card);
+  border-color: var(--sa-border); border-radius: 12px; }
+
+/* ---- Sidebar: contextual About ---- */
+.stApp [data-testid="stSidebar"] .sa-about h3 { font-size: 1.05rem; margin: 0 0 .4rem 0; padding: 0; }
+.stApp [data-testid="stSidebar"] .sa-about p { color: var(--sa-text-2); font-size: .82rem; line-height: 1.45; margin: 0; }
+.stApp [data-testid="stSidebar"] .sa-about p.sa-note { color: var(--sa-text); font-size: .78rem; }
+.stApp [data-testid="stSidebar"] ul { margin: .3rem 0 .5rem 0; padding-left: 1.1rem; }
+.stApp [data-testid="stSidebar"] li { color: var(--sa-text-2); font-size: .82rem; line-height: 1.45; margin-bottom: .2rem; }
+.stApp [data-testid="stSidebar"] li strong { color: var(--sa-text); }
+
+/* ---- Portfolio: the Holdings table needs ~36rem; below that Manage wraps underneath ---- */
+.stApp .st-key-pf_layout [data-testid="stHorizontalBlock"] { flex-wrap: wrap; }
+.stApp .st-key-pf_layout [data-testid="stColumn"]:first-child { min-width: min(100%, 36rem); }
+.stApp .st-key-pf_layout [data-testid="stColumn"]:last-child { min-width: min(100%, 16rem); }
+
+/* ---- Portfolio: selected company ---- */
+.stApp .sa-selected { background: var(--sa-card); border: 1px solid var(--sa-border);
+  border-left: 3px solid var(--sa-accent); border-radius: 12px; padding: .6rem .9rem;
+  margin: .5rem 0 .6rem 0; }
+.stApp .sa-selected .k { color: var(--sa-text-2); font-size: .72rem; font-weight: 500;
+  text-transform: uppercase; letter-spacing: .06em; }
+.stApp .sa-selected .v { color: var(--sa-text); font-size: 1rem; font-weight: 600;
+  line-height: 1.3; overflow-wrap: anywhere; }
+.stApp .sa-selected .d { color: var(--sa-text-2); font-size: .8rem; margin-top: .1rem; }
+
+/* ---- Narrow screens ---- */
+@media (max-width: 640px) {
+  .stApp .modebar-container { display: none; }  /* the chart toolbar would sit on top of a wrapped legend */
+  .stApp .block-container { padding-left: 1rem; padding-right: 1rem; }
+  .stApp .hero p { font-size: .88rem; }
+}
+"""
+
+st.markdown(
+    "<style>\n" + FONT_IMPORT + theme_variables_css() + COMPONENT_CSS + "</style>",
     unsafe_allow_html=True,
 )
 
@@ -287,78 +382,23 @@ def fetch_chart_frame(ticker: str):
     if hist is None or hist.empty:
         return "No price history found for this ticker."
 
-    df = hist.copy()
-    if getattr(df.index, "tz", None) is not None:
-        df.index = df.index.tz_localize(None)
-    close = df["Close"]
-    for window in (20, 50, 200):
-        df[f"SMA{window}"] = SMAIndicator(close, window).sma_indicator()
-    bands = BollingerBands(close, 20, 2)
-    df["BBU"], df["BBL"] = bands.bollinger_hband(), bands.bollinger_lband()
-    df["RSI"] = RSIIndicator(close, 14).rsi()
-    macd = MACD(close)
-    df["MACD"], df["SIG"], df["HIST"] = macd.macd(), macd.macd_signal(), macd.macd_diff()
+    df = compute_indicator_frame(hist)
+    if len(df) < 2:
+        return "Not enough complete price history to draw a chart for this ticker."
     return df
 
 
 PERIODS = {"3M": 63, "6M": 126, "1Y": 252, "2Y": 504, "5Y": 5000}
 
 
-def build_chart(df: pd.DataFrame, overlays: list[str], height: int = 760) -> go.Figure:
-    fig = make_subplots(
-        rows=4, cols=1, shared_xaxes=True, vertical_spacing=0.025,
-        row_heights=[0.55, 0.12, 0.165, 0.165],
-    )
-    fig.add_trace(go.Candlestick(
-        x=df.index, open=df["Open"], high=df["High"], low=df["Low"], close=df["Close"],
-        increasing_line_color=UP, decreasing_line_color=DOWN,
-        increasing_fillcolor=UP, decreasing_fillcolor=DOWN,
-        name="Price", showlegend=False,
-    ), row=1, col=1)
-
-    if "Bollinger Bands" in overlays:
-        fig.add_trace(go.Scatter(x=df.index, y=df["BBU"], name="Bollinger",
-                                 line=dict(color="rgba(150,160,180,.45)", width=1)), row=1, col=1)
-        fig.add_trace(go.Scatter(x=df.index, y=df["BBL"], name="Bollinger low", showlegend=False,
-                                 line=dict(color="rgba(150,160,180,.45)", width=1),
-                                 fill="tonexty", fillcolor="rgba(150,160,180,.08)"), row=1, col=1)
-    for window, color in ((20, "#F6C177"), (50, "#8EC5FF"), (200, "#C4A7FF")):
-        if f"SMA {window}" in overlays:
-            fig.add_trace(go.Scatter(x=df.index, y=df[f"SMA{window}"], name=f"SMA {window}",
-                                     line=dict(color=color, width=1.4)), row=1, col=1)
-
-    vol_colors = [UP if c >= o else DOWN for c, o in zip(df["Close"], df["Open"])]
-    fig.add_trace(go.Bar(x=df.index, y=df["Volume"], marker_color=vol_colors, opacity=.55,
-                         name="Volume", showlegend=False), row=2, col=1)
-
-    fig.add_trace(go.Scatter(x=df.index, y=df["RSI"], name="RSI (14)", showlegend=False,
-                             line=dict(color="#8EC5FF", width=1.4)), row=3, col=1)
-    for level in (30, 70):
-        fig.add_hline(y=level, line=dict(color="rgba(150,160,180,.4)", width=1, dash="dot"),
-                      row=3, col=1)
-
-    hist_colors = [UP if v >= 0 else DOWN for v in df["HIST"].fillna(0)]
-    fig.add_trace(go.Bar(x=df.index, y=df["HIST"], marker_color=hist_colors, opacity=.5,
-                         name="Histogram", showlegend=False), row=4, col=1)
-    fig.add_trace(go.Scatter(x=df.index, y=df["MACD"], name="MACD", showlegend=False,
-                             line=dict(color="#F6C177", width=1.3)), row=4, col=1)
-    fig.add_trace(go.Scatter(x=df.index, y=df["SIG"], name="Signal", showlegend=False,
-                             line=dict(color="#C4A7FF", width=1.3)), row=4, col=1)
-
-    fig.update_layout(
-        template="plotly_dark", height=height, margin=dict(l=10, r=10, t=10, b=10),
-        paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
-        hovermode="x unified", xaxis_rangeslider_visible=False,
-        legend=dict(orientation="h", y=1.03, x=0, bgcolor="rgba(0,0,0,0)"),
-        font=dict(family="IBM Plex Sans"),
-    )
-    fig.update_xaxes(rangebreaks=[dict(bounds=["sat", "mon"])], gridcolor="rgba(255,255,255,.04)")
-    fig.update_yaxes(gridcolor="rgba(255,255,255,.05)")
-    fig.update_yaxes(title_text="Price (₹)", row=1, col=1)
-    fig.update_yaxes(title_text="Vol", row=2, col=1)
-    fig.update_yaxes(title_text="RSI", range=[0, 100], row=3, col=1)
-    fig.update_yaxes(title_text="MACD", row=4, col=1)
-    return fig
+def render_price_chart(view: pd.DataFrame, overlays: list[str], height: int):
+    """One renderer for the Charts page and the Assistant expander."""
+    if view is None or len(view) < 2:
+        st.info("Not enough price history to draw a chart for this period.")
+        return
+    st.plotly_chart(build_chart(view, overlays, height), use_container_width=True)
+    for note in chart_notes(view, overlays):
+        st.caption(f"ℹ️ {note}")
 
 
 def signal_cards(df: pd.DataFrame):
@@ -537,11 +577,11 @@ def render_message(msg: dict, is_last: bool):
                 frame = fetch_chart_frame(tickers[0])
                 if isinstance(frame, pd.DataFrame):
                     with st.expander("📉 Price chart & technical indicators (6M)"):
-                        view = frame.tail(PERIODS["6M"])
-                        st.plotly_chart(
-                            build_chart(view, ["SMA 20", "SMA 50", "Bollinger Bands"], 620),
-                            use_container_width=True,
+                        overlays = st.multiselect(
+                            "Overlays", OVERLAY_OPTIONS, default=DEFAULT_OVERLAYS,
+                            key="assistant_chart_overlays",
                         )
+                        render_price_chart(frame.tail(PERIODS["6M"]), overlays, 780)
         text = msg["content"]
         if "PORTFOLIO" in text[:150].upper() and "====" in text[:150]:
             st.code(text.strip("= \n"), language=None)  # tool output is column-aligned text
@@ -583,11 +623,15 @@ def view_charts():
     c1, c2 = st.columns([2, 1])
     default = (st.session_state.last_ticker or "INFY.NS").replace(".NS", "")
     company = c1.text_input("Company name or NSE symbol", value=default, key="chart_company")
-    period = c2.segmented_control("Range", list(PERIODS), default="6M", key="chart_period") or "6M"
-    overlays = st.multiselect(
-        "Overlays", ["SMA 20", "SMA 50", "SMA 200", "Bollinger Bands"],
-        default=["SMA 20", "SMA 50", "Bollinger Bands"], key="chart_overlays",
-    )
+    # Streamlit drops the state of widgets that aren't rendered (e.g. while on another page), so the
+    # choices are mirrored into plain session keys and restored before the widgets are created.
+    for key, saved, fallback in (("chart_period", "saved_chart_period", "6M"),
+                                 ("chart_overlays", "saved_chart_overlays", list(DEFAULT_OVERLAYS))):
+        if key not in st.session_state:
+            st.session_state[key] = st.session_state.get(saved, fallback)
+    period = c2.segmented_control("Range", list(PERIODS), key="chart_period") or "6M"
+    overlays = st.multiselect("Overlays", OVERLAY_OPTIONS, key="chart_overlays")
+    st.session_state.saved_chart_period, st.session_state.saved_chart_overlays = period, list(overlays)
 
     ticker = resolve_symbol(company)
     if not ticker:
@@ -603,10 +647,97 @@ def view_charts():
 
     render_snapshot(ticker)
     view = frame.tail(PERIODS[period])
-    st.plotly_chart(build_chart(view, overlays), use_container_width=True)
+    render_price_chart(view, overlays, 920)
     st.markdown("##### Indicator read-out")
     signal_cards(frame)
-    st.caption("Signals are computed from the same indicators the AI report uses (SMA, RSI-14, MACD 12/26/9, Bollinger 20/2).")
+    st.caption(
+        "Signals are computed from the same indicators the AI report uses (SMA, RSI-14, MACD 12/26/9, "
+        "Bollinger 20/2). They are analytical indicators, not predictions or guarantees of future returns."
+    )
+
+
+# Newer Streamlit can commit a text input while the user types (after a short pause); older
+# versions commit on Enter / when the field loses focus. Detect it rather than assume.
+_LIVE_SEARCH = {"live": True} if "live" in inspect.signature(st.text_input).parameters else {}
+PF_QUERY, PF_SELECTED, PF_FLASH, PF_RESET, PF_LABELS = (
+    "pf_query", "pf_selected", "pf_flash", "pf_reset", "pf_labels")
+
+
+def _remember_pick(radio_key: str):
+    """Radio on_change: store the explicitly chosen company so it survives every rerun."""
+    symbol = st.session_state.get(PF_LABELS, {}).get(st.session_state.get(radio_key))
+    if symbol:
+        st.session_state[PF_SELECTED] = symbol
+
+
+def _clear_pick():
+    st.session_state.pop(PF_SELECTED, None)
+
+
+@st.fragment
+def portfolio_search():
+    """
+    Search -> explicit selection -> confirm. A fragment, so typing re-runs only this widget group
+    (not the holdings table and its price look-ups). The chosen company lives in
+    st.session_state[PF_SELECTED] until it is added, cleared or replaced; it is never auto-picked.
+    """
+    flash = st.session_state.pop(PF_FLASH, None)
+    if flash:
+        getattr(st, flash[0])(flash[1])
+    if st.session_state.pop(PF_RESET, False):
+        st.session_state[PF_QUERY] = ""   # allowed: runs before the widget is created this run
+
+    universe = load_universe()
+    if not universe.ok:
+        st.error(f"{universe.error} Company search is unavailable, but you can still remove holdings "
+                 "or load the sample portfolio.")
+        return
+
+    query = st.text_input(
+        "Search NSE companies", placeholder="Company name or ticker, e.g. Infosys or INFY",
+        key=PF_QUERY, **_LIVE_SEARCH,
+    )
+    result = search(query, universe)
+    if result.matches:
+        labels = {c.label: c.symbol for c in result.companies}
+        st.session_state[PF_LABELS] = labels
+        radio_key = f"pf_pick::{normalise(query)}"   # new query -> fresh radio, never a stale index
+        st.radio("Matching companies", list(labels), index=None, key=radio_key,
+                 on_change=_remember_pick, args=(radio_key,))
+        if result.total > len(result.matches):
+            st.caption(f"Showing the top {len(result.matches)} of {result.total} matches — "
+                       "keep typing to narrow it down.")
+    elif query.strip():
+        st.warning(result.message)
+    else:
+        st.caption(result.message)
+
+    chosen = universe.get(st.session_state.get(PF_SELECTED))
+    if st.session_state.get(PF_SELECTED) and chosen is None:
+        st.session_state.pop(PF_SELECTED, None)   # symbol no longer in the list
+    if chosen:
+        note = " · already in your portfolio" if chosen.ticker in holding_tickers(portfolio_tool) else ""
+        st.markdown(
+            f'<div class="sa-selected"><div class="k">Selected</div>'
+            f'<div class="v">{html.escape(chosen.name)}</div>'
+            f'<div class="d">{html.escape(chosen.symbol)} · NSE · {html.escape(chosen.ticker)}{note}</div></div>',
+            unsafe_allow_html=True,
+        )
+    else:
+        st.caption("No company selected yet — pick one of the suggestions above." if result.matches
+                   else "No company selected yet.")
+
+    add_col, clear_col = st.columns([3, 2])
+    if add_col.button("➕ Add to Portfolio", type="primary", use_container_width=True, key="pf_add_btn"):
+        outcome = add_selected(st.session_state.get(PF_SELECTED), universe, portfolio_tool)
+        if outcome.added:
+            st.session_state[PF_FLASH] = (outcome.level, outcome.message)
+            st.session_state.pop(PF_SELECTED, None)
+            st.session_state[PF_RESET] = True
+            st.rerun()   # full rerun so the Holdings table refreshes
+        getattr(st, outcome.level)(outcome.message)
+    if chosen:
+        clear_col.button("Clear", use_container_width=True, key="pf_clear_btn", on_click=_clear_pick)
 
 
 def view_portfolio():
@@ -615,18 +746,12 @@ def view_portfolio():
         return
 
     holdings = portfolio_tool.load_portfolio()
-    left, right = st.columns([3, 2])
+    with st.container(key="pf_layout"):    # keyed so the CSS below can make the two columns wrap
+        left, right = st.columns([3, 2])
 
     with right:
         st.markdown("##### Manage")
-        new = st.text_input("Add a company", placeholder="e.g. Wipro", key="pf_add")
-        if st.button("➕ Add to portfolio", use_container_width=True) and new:
-            ticker = resolve_symbol(new)
-            if ticker:
-                st.success(portfolio_tool.add_stock(ticker))
-                st.rerun()
-            else:
-                st.warning("Couldn't find that company.")
+        portfolio_search()
         if holdings:
             labels = {f'{h["company"]} ({h["ticker"]})': h["ticker"] for h in holdings}
             pick = st.selectbox("Remove", list(labels), index=None, placeholder="Choose a holding", key="pf_rm")
@@ -645,7 +770,7 @@ def view_portfolio():
     with left:
         st.markdown("##### Holdings")
         if not holdings:
-            st.info("Your portfolio is empty. Add a company, or load the sample portfolio.")
+            st.info("Your portfolio is empty. Search for a company under Manage and add it, or load the sample portfolio.")
             return
         rows = []
         for h in holdings:
@@ -672,13 +797,84 @@ def view_portfolio():
 # ---------------------------------------------------------------------------
 # Layout
 # ---------------------------------------------------------------------------
+PAGES = ["💬 Assistant", "📉 Charts", "💼 Portfolio"]
+DEFAULT_PAGE = PAGES[0]
+
+# Contextual sidebar copy. Keyed by the navigation labels so it can never disagree with the page shown.
+ABOUT = {
+    "💬 Assistant": {
+        "title": "About Assistant",
+        "summary": (
+            "An AI-powered NSE stock research assistant that combines available market data, technical "
+            "indicators, company information, financial metrics, and recent news to produce structured "
+            "research reports."
+        ),
+        "points": [
+            "**Analyze** a company, e.g. “Analyze Infosys”.",
+            "**Compare** two stocks, e.g. “Compare Infosys and TCS”.",
+            "**Research** technical indicators and financial metrics such as P/E.",
+            "**News**: the latest headlines for a company.",
+            "**Follow up** with “its P/E?” and the last company is remembered.",
+            "**Portfolio**: add, remove or view holdings, or ask for “Analyze portfolio”.",
+        ],
+        "note": "Reports are written by Gemini from the data the app can fetch. They can be incomplete or wrong.",
+    },
+    "📉 Charts": {
+        "title": "About Charts",
+        "summary": (
+            "Explore historical NSE stock prices with candlestick charts, moving averages, Bollinger Bands, "
+            "RSI, MACD, and volume."
+        ),
+        "points": [
+            "**Pick a stock** by company name or NSE symbol.",
+            "**Choose a range**: 3M, 6M, 1Y, 2Y or 5Y.",
+            "**Overlays**: switch SMA 20, SMA 50, SMA 200 and Bollinger Bands on or off.",
+            "**Panels**: RSI (14) is read against its 30 and 70 levels; MACD shows its line, signal line and histogram.",
+            "**Read-out**: the cards under the chart summarise the latest RSI, MACD, trend and Bollinger position.",
+        ],
+        "note": "Historical indicators describe the past. They do not guarantee future performance.",
+    },
+    "💼 Portfolio": {
+        "title": "About Portfolio",
+        "summary": (
+            "Build an NSE stock watchlist and review available market metrics for your selected companies "
+            "in one place."
+        ),
+        "points": [
+            "**Search** by company name or ticker, **select** a suggestion, then press Add to Portfolio.",
+            "**Remove** a holding whenever you like.",
+            "**Review** price, day change, P/E and market cap in the Holdings table, where available.",
+            "**Sample**: load a sample portfolio while your list is empty.",
+            "**Analysis**: ask the Assistant to “Analyze portfolio”.",
+        ],
+        "note": "This is a watchlist. It does not trade, connect to a broker, or track quantities or returns.",
+    },
+}
+
+
+def render_about(page: str):
+    about = ABOUT.get(page, ABOUT[DEFAULT_PAGE])
+    st.markdown(f"<div class=\"sa-about\"><h3>{html.escape(about['title'])}</h3></div>", unsafe_allow_html=True)
+    st.markdown(f"<div class=\"sa-about\"><p>{html.escape(about['summary'])}</p></div>", unsafe_allow_html=True)
+    st.markdown("\n".join(f"- {p}" for p in about["points"]))
+    st.markdown(f"<div class=\"sa-about\"><p class=\"sa-note\">{html.escape(about['note'])}</p></div>", unsafe_allow_html=True)
+
+
+st.markdown(
+    '<div class="hero"><h1>AI Stock <span class="accent">Analyst</span></h1>'
+    "<p>NSE equities · live data · technical indicators · news · Gemini-written research</p></div>",
+    unsafe_allow_html=True,
+)
+st.write("")
+
+# `page` is the single source of truth: the sidebar About and the view router both use this value
+# (including the fallback when the active segment is clicked again and the control returns None).
+page = st.segmented_control(
+    "View", PAGES, default=DEFAULT_PAGE, key="page", label_visibility="collapsed",
+) or DEFAULT_PAGE
+
 with st.sidebar:
-    st.markdown("### About")
-    st.caption(
-        "An agentic research assistant for **NSE-listed** stocks. It fetches live market data, "
-        "computes SMA / RSI / MACD / Bollinger indicators, reads recent news and asks "
-        "Gemini to write the report."
-    )
+    render_about(page)
     st.divider()
     left = max(MAX_QUERIES - st.session_state.n_queries, 0)
     st.progress(left / MAX_QUERIES, text=f"AI questions left this session: {left}/{MAX_QUERIES}")
@@ -693,18 +889,6 @@ with st.sidebar:
         "Market data may be delayed or inaccurate. Do your own research.</p>",
         unsafe_allow_html=True,
     )
-
-st.markdown(
-    '<div class="hero"><h1>AI Stock <span class="accent">Analyst</span></h1>'
-    "<p>NSE equities · live data · technical indicators · news · Gemini-written research</p></div>",
-    unsafe_allow_html=True,
-)
-st.write("")
-
-page = st.segmented_control(
-    "View", ["💬 Assistant", "📉 Charts", "💼 Portfolio"],
-    default="💬 Assistant", key="page", label_visibility="collapsed",
-) or "💬 Assistant"
 
 if page == "💬 Assistant":
     view_assistant()
